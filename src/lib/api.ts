@@ -2,6 +2,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
 import type {
   ModelPriceEntry,
+  SourceHome,
   SyncResult,
   UsageRange,
   UsageSnapshot,
@@ -14,11 +15,36 @@ export function isDesktopRuntime() {
 
 export async function getUsageSnapshot(
   range: UsageRange,
+  source: string = "all",
 ): Promise<UsageSnapshot> {
   if (!isDesktopRuntime()) {
-    return demoSnapshot(range);
+    return demoSnapshot(range, source);
   }
-  return invoke<UsageSnapshot>("get_usage_snapshot", { range });
+  return invoke<UsageSnapshot>("get_usage_snapshot", { range, source });
+}
+
+export async function getSourceHomes(): Promise<SourceHome[]> {
+  if (!isDesktopRuntime()) return [];
+  return invoke<SourceHome[]>("get_source_homes");
+}
+
+export async function chooseSourceHome(
+  currentPath?: string,
+): Promise<SourceHome | null> {
+  if (!isDesktopRuntime()) return null;
+  const selected = await open({
+    directory: true,
+    multiple: false,
+    defaultPath: currentPath,
+    title: "添加 Claude Code / Codex / ZCode 数据目录",
+  });
+  if (typeof selected !== "string") return null;
+  return invoke<SourceHome>("add_source_home", { path: selected });
+}
+
+export async function removeSourceHome(path: string): Promise<void> {
+  if (!isDesktopRuntime()) return;
+  await invoke("remove_source_home", { path });
 }
 
 export async function getAccountWeeklyUsage(): Promise<WeeklyUsage | null> {
@@ -70,18 +96,6 @@ export async function hideFloatingWindow() {
   if (isDesktopRuntime()) await invoke("hide_floating_window");
 }
 
-export async function chooseCodexHome(currentPath?: string) {
-  if (!isDesktopRuntime()) return null;
-  const selected = await open({
-    directory: true,
-    multiple: false,
-    defaultPath: currentPath,
-    title: "选择 Claude Code / Codex Home",
-  });
-  if (typeof selected !== "string") return null;
-  return invoke<string>("set_codex_home", { path: selected });
-}
-
 export async function getUsedModelPrices() {
   if (!isDesktopRuntime()) {
     return [
@@ -124,7 +138,28 @@ export async function updateModelPrice(entry: ModelPriceEntry) {
     });
 }
 
-function demoSnapshot(range: UsageRange): UsageSnapshot {
+function demoSnapshot(range: UsageRange, source = "all"): UsageSnapshot {
+  const labels: Record<string, { kind: string; label: string; brand: string }> =
+    {
+      all: { kind: "all", label: "全部来源", brand: "ALL SOURCES / USAGE" },
+      claudeCode: {
+        kind: "claudeCode",
+        label: "Claude Code",
+        brand: "CLAUDE CODE / USAGE",
+      },
+      codexCli: {
+        kind: "codexCli",
+        label: "Codex CLI",
+        brand: "CODEX CLI / USAGE",
+      },
+      chatGptCodex: {
+        kind: "chatGptCodex",
+        label: "ChatGPT Codex",
+        brand: "CHATGPT CODEX / USAGE",
+      },
+      zcode: { kind: "zcode", label: "ZCode", brand: "ZCODE / USAGE" },
+    };
+  const identity = labels[source] ?? labels.all;
   const models = [
     {
       model: "gpt-5.3-codex",
@@ -175,9 +210,9 @@ function demoSnapshot(range: UsageRange): UsageSnapshot {
   return {
     generatedAt: Math.floor(Date.now() / 1000),
     codexHome: "~/.codex",
-    sourceKind: "codexCli",
-    sourceLabel: "Codex CLI",
-    sourceBrand: "CODEX CLI / USAGE",
+    sourceKind: identity.kind as UsageSnapshot["sourceKind"],
+    sourceLabel: identity.label,
+    sourceBrand: identity.brand,
     summary: {
       totalTokens: models.reduce((sum, model) => sum + model.totalTokens, 0),
       freshInputTokens: models.reduce(
@@ -197,6 +232,10 @@ function demoSnapshot(range: UsageRange): UsageSnapshot {
     },
     trends,
     models,
+    projects: [
+      { project: "demo-project", totalTokens: 628_400, calls: 21 },
+      { project: "side-quest", totalTokens: 171_300, calls: 8 },
+    ],
     recent: models.flatMap((model, modelIndex) =>
       Array.from({ length: modelIndex === 0 ? 5 : 2 }, (_, index) => ({
         id: `${model.model}-${index}`,
@@ -210,5 +249,6 @@ function demoSnapshot(range: UsageRange): UsageSnapshot {
         estimatedCostUsd: (0.15 + index * 0.03).toFixed(4),
       })),
     ),
+    quotaEstimate: null,
   };
 }

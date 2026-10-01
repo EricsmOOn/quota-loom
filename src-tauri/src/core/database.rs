@@ -1,7 +1,7 @@
 use crate::core::pricing::{CatalogModelPrice, ModelPrice, DEFAULT_PRICES};
 use crate::core::types::{
-    DataSourceKind, ModelPriceEntry, ModelUsage, ParseOutcome, RecentUsageEvent, SessionCursor,
-    TokenTotals, UsageRange, UsageSnapshot, UsageSummary, UsageTrendPoint,
+    DataSourceKind, ModelPriceEntry, ModelUsage, ParseOutcome, ProjectUsage, RecentUsageEvent,
+    SessionCursor, TokenTotals, UsageRange, UsageSnapshot, UsageSummary, UsageTrendPoint,
 };
 use rusqlite::{params, Connection, OptionalExtension};
 use rust_decimal::Decimal;
@@ -59,7 +59,9 @@ impl UsageDatabase {
                     input_tokens INTEGER NOT NULL,
                     cached_input_tokens INTEGER NOT NULL,
                     output_tokens INTEGER NOT NULL,
-                    source_file TEXT NOT NULL
+                    source_file TEXT NOT NULL,
+                    source TEXT NOT NULL DEFAULT 'codexCli',
+                    project TEXT NOT NULL DEFAULT ''
                 );
                 CREATE INDEX IF NOT EXISTS idx_usage_events_time ON usage_events(occurred_at);
                 CREATE INDEX IF NOT EXISTS idx_usage_events_model_time ON usage_events(model, occurred_at);
@@ -79,6 +81,7 @@ impl UsageDatabase {
                     previous_cached INTEGER,
                     previous_output INTEGER,
                     replay_active INTEGER NOT NULL DEFAULT 0,
+                    project TEXT,
                     updated_at INTEGER NOT NULL
                 );
 
@@ -128,6 +131,72 @@ impl UsageDatabase {
                 )
                 .map_err(|error| error.to_string())?;
         }
+        // B3 多来源共存：usage_events 增加来源列。
+        // 历史数据按 source_file 的目录特征回填（Codex 家族保持默认值，
+        // CLI 与 ChatGPT 同目录，无法从路径区分，影响仅限按来源筛选的展示）。
+        let has_source = connection
+            .query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM pragma_table_info('usage_events') WHERE name = 'source'
+                 )",
+                [],
+                |row| Ok(row.get::<_, i64>(0)? != 0),
+            )
+            .map_err(|error| error.to_string())?;
+        if !has_source {
+            connection
+                .execute(
+                    "ALTER TABLE usage_events ADD COLUMN source TEXT NOT NULL DEFAULT 'codexCli'",
+                    [],
+                )
+                .map_err(|error| error.to_string())?;
+            connection
+                .execute_batch(
+                    "UPDATE usage_events SET source='zcode'
+                     WHERE source_file LIKE '%\\.zcode%' OR source_key LIKE 'model-io-%';
+                     UPDATE usage_events SET source='claudeCode'
+                     WHERE source_file LIKE '%\\.claude%';",
+                )
+                .map_err(|error| error.to_string())?;
+        }
+        connection
+            .execute_batch(
+                "CREATE INDEX IF NOT EXISTS idx_usage_events_source_kind
+                 ON usage_events(source, occurred_at);",
+            )
+            .map_err(|error| error.to_string())?;
+        // B4 项目维度：usage_events 与游标补 project 列
+        let has_project = connection
+            .query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM pragma_table_info('usage_events') WHERE name = 'project'
+                 )",
+                [],
+                |row| Ok(row.get::<_, i64>(0)? != 0),
+            )
+            .map_err(|error| error.to_string())?;
+        if !has_project {
+            connection
+                .execute(
+                    "ALTER TABLE usage_events ADD COLUMN project TEXT NOT NULL DEFAULT ''",
+                    [],
+                )
+                .map_err(|error| error.to_string())?;
+        }
+        let cursor_has_project = connection
+            .query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM pragma_table_info('session_cursors') WHERE name = 'project'
+                 )",
+                [],
+                |row| Ok(row.get::<_, i64>(0)? != 0),
+            )
+            .map_err(|error| error.to_string())?;
+        if !cursor_has_project {
+            connection
+                .execute("ALTER TABLE session_cursors ADD COLUMN project TEXT", [])
+                .map_err(|error| error.to_string())?;
+        }
         for (model, display, input, cached, output) in DEFAULT_PRICES {
             connection
                 .execute(
@@ -148,7 +217,7 @@ impl UsageDatabase {
             .query_row(
                 "SELECT source_key, path, file_size, modified_ns, byte_offset, event_index,
                         thread_id, current_model, previous_input, previous_cached, previous_output,
-                        replay_active
+                        replay_active, project
                  FROM session_cursors WHERE source_key = ?1",
                 [source_key],
                 |row| {
@@ -174,6 +243,7 @@ impl UsageDatabase {
                         current_model: row.get(7)?,
                         previous_total,
                         replay_active: row.get::<_, i64>(11)? != 0,
+                        project: row.get(12)?,
                     })
                 },
             )
@@ -181,27 +251,50 @@ impl UsageDatabase {
             .map_err(|error| error.to_string())
     }
 
-    pub fn apply_parse_outcome(&self, outcome: &ParseOutcome) -> Result<u64, String> {
+    pub fn purge_legacy_zcode_rollout_events(&self) -> Result<u64, String> {
+        let connection = self.connection.lock().map_err(|error| error.to_string())?;
+        // 游标键在 B3 前是文件名、之后是完整路径，两种形态都覆盖
+        let deleted = connection
+            .execute(
+                "DELETE FROM usage_events
+                 WHERE source_key LIKE 'model-io-%'
+                    OR source_key LIKE '%\\model-io-%'
+                    OR source_file LIKE '%\\model-io-%'",
+                [],
+            )
+            .map_err(|error| error.to_string())?;
+        Ok(deleted as u64)
+    }
+
+    pub fn apply_parse_outcome(
+        &self,
+        outcome: &ParseOutcome,
+        source: DataSourceKind,
+    ) -> Result<u64, String> {
         let mut connection = self.connection.lock().map_err(|error| error.to_string())?;
         let transaction = connection
             .transaction()
             .map_err(|error| error.to_string())?;
         if outcome.reset_required {
+            // 游标键可能是文件名（旧版）或完整路径（B3 起），
+            // 按 source_file 兜底确保旧事件也被清理。
             transaction
                 .execute(
-                    "DELETE FROM usage_events WHERE source_key = ?1",
-                    [&outcome.cursor.source_key],
+                    "DELETE FROM usage_events
+                     WHERE source_key = ?1 OR source_file = ?2",
+                    [&outcome.cursor.source_key, &outcome.cursor.path],
                 )
                 .map_err(|error| error.to_string())?;
         }
+        let source_key_text = source.id_key();
         let mut inserted = 0_u64;
         for event in &outcome.events {
             inserted += transaction
                 .execute(
                     "INSERT OR IGNORE INTO usage_events
                      (id, source_key, thread_id, event_index, occurred_at, model,
-                      input_tokens, cached_input_tokens, output_tokens, source_file)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                      input_tokens, cached_input_tokens, output_tokens, source_file, source, project)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
                     params![
                         event.id,
                         event.source_key,
@@ -213,6 +306,8 @@ impl UsageDatabase {
                         event.tokens.cached_input_tokens as i64,
                         event.tokens.output_tokens as i64,
                         event.source_file,
+                        source_key_text,
+                        event.project,
                     ],
                 )
                 .map_err(|error| error.to_string())? as u64;
@@ -222,14 +317,15 @@ impl UsageDatabase {
             .execute(
                 "INSERT INTO session_cursors
                  (source_key, path, file_size, modified_ns, byte_offset, event_index, thread_id,
-                  current_model, previous_input, previous_cached, previous_output, replay_active, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, strftime('%s','now'))
+                  current_model, previous_input, previous_cached, previous_output, replay_active, project, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, strftime('%s','now'))
                  ON CONFLICT(source_key) DO UPDATE SET
                     path=excluded.path, file_size=excluded.file_size, modified_ns=excluded.modified_ns,
                     byte_offset=excluded.byte_offset, event_index=excluded.event_index,
                     thread_id=excluded.thread_id, current_model=excluded.current_model,
                     previous_input=excluded.previous_input, previous_cached=excluded.previous_cached,
                     previous_output=excluded.previous_output, replay_active=excluded.replay_active,
+                    project=excluded.project,
                     updated_at=excluded.updated_at",
                 params![
                     outcome.cursor.source_key,
@@ -244,6 +340,7 @@ impl UsageDatabase {
                     previous.map(|tokens| tokens.cached_input_tokens as i64),
                     previous.map(|tokens| tokens.output_tokens as i64),
                     i64::from(outcome.cursor.replay_active),
+                    outcome.cursor.project,
                 ],
             )
             .map_err(|error| error.to_string())?;
@@ -405,17 +502,20 @@ impl UsageDatabase {
     pub fn snapshot(
         &self,
         codex_home: &Path,
-        source_kind: DataSourceKind,
+        display_kind: DataSourceKind,
         range: UsageRange,
+        source_filter: Option<&str>,
     ) -> Result<UsageSnapshot, String> {
         let connection = self.connection.lock().map_err(|error| error.to_string())?;
-        let mut models = query_models(&connection, range)?;
+        let mut models = query_models(&connection, range, source_filter)?;
         let prices = load_prices(&connection)?;
+        let projects = query_projects(&connection, range, source_filter)?;
         let threads = connection
             .query_row(
                 "SELECT COUNT(DISTINCT thread_id) FROM usage_events
-                 WHERE occurred_at >= ?1 AND occurred_at <= ?2",
-                params![range.start_at, range.end_at],
+                 WHERE occurred_at >= ?1 AND occurred_at <= ?2
+                   AND (?3 IS NULL OR source = ?3)",
+                params![range.start_at, range.end_at, source_filter],
                 |row| row.get::<_, i64>(0),
             )
             .map_err(|error| error.to_string())?
@@ -463,7 +563,7 @@ impl UsageDatabase {
         };
         summary.estimated_cost_usd = has_priced_model.then(|| format_cost(total_cost));
 
-        let mut recent = query_recent(&connection, range, 30)?;
+        let mut recent = query_recent(&connection, range, source_filter, 30)?;
         for event in &mut recent {
             let totals = TokenTotals {
                 input_tokens: event
@@ -480,46 +580,92 @@ impl UsageDatabase {
         Ok(UsageSnapshot {
             generated_at: chrono::Utc::now().timestamp(),
             codex_home: codex_home.to_string_lossy().to_string(),
-            source_kind,
-            source_label: source_kind.label().to_string(),
-            source_brand: source_kind.brand().to_string(),
+            source_kind: display_kind,
+            source_label: display_kind.label().to_string(),
+            source_brand: display_kind.brand().to_string(),
             summary,
-            trends: query_trends(&connection, range, &prices)?,
+            trends: query_trends(&connection, range, &prices, source_filter)?,
             models,
+            projects,
             recent,
+            quota_estimate: None,
         })
+    }
+
+    /// 平台计费口径的 token 总量（input + output），
+    /// 用作 ZCode 套餐余额估算的"今日已用"。
+    pub fn query_platform_tokens(&self, start_at: i64, end_at: i64) -> Result<u64, String> {
+        let connection = self.connection.lock().map_err(|error| error.to_string())?;
+        connection
+            .query_row(
+                "SELECT COALESCE(SUM(input_tokens + output_tokens), 0)
+                 FROM usage_events
+                 WHERE occurred_at >= ?1 AND occurred_at <= ?2 AND source = 'zcode'",
+                params![start_at, end_at],
+                |row| row.get::<_, i64>(0),
+            )
+            .map(|tokens| tokens.max(0) as u64)
+            .map_err(|error| error.to_string())
+    }
+
+    /// 移除某个数据 Home 时清掉它名下的事件与游标。
+    pub fn purge_source_home(&self, home: &Path) -> Result<u64, String> {
+        let connection = self.connection.lock().map_err(|error| error.to_string())?;
+        let prefix = format!("{}\\%", home.to_string_lossy().trim_end_matches('\\'));
+        let deleted_events = connection
+            .execute(
+                "DELETE FROM usage_events
+                 WHERE source_file = ?1 OR source_file LIKE ?2",
+                params![home.to_string_lossy(), prefix],
+            )
+            .map_err(|error| error.to_string())?;
+        connection
+            .execute(
+                "DELETE FROM session_cursors WHERE source_key = ?1 OR source_key LIKE ?2",
+                params![home.to_string_lossy(), prefix],
+            )
+            .map_err(|error| error.to_string())?;
+        Ok(deleted_events as u64)
     }
 }
 
-fn query_models(connection: &Connection, range: UsageRange) -> Result<Vec<ModelUsage>, String> {
+fn query_models(
+    connection: &Connection,
+    range: UsageRange,
+    source_filter: Option<&str>,
+) -> Result<Vec<ModelUsage>, String> {
     let mut statement = connection
         .prepare(
             "SELECT model, COALESCE(SUM(input_tokens),0), COALESCE(SUM(cached_input_tokens),0),
                     COALESCE(SUM(output_tokens),0), COUNT(*)
              FROM usage_events WHERE occurred_at >= ?1 AND occurred_at <= ?2
+               AND (?3 IS NULL OR source = ?3)
              GROUP BY model ORDER BY SUM(input_tokens + output_tokens) DESC",
         )
         .map_err(|error| error.to_string())?;
     let rows = statement
-        .query_map(params![range.start_at, range.end_at], |row| {
-            let input = row.get::<_, i64>(1)?.max(0) as u64;
-            let cached = (row.get::<_, i64>(2)?.max(0) as u64).min(input);
-            let output = row.get::<_, i64>(3)?.max(0) as u64;
-            Ok(ModelUsage {
-                model: row.get(0)?,
-                total_tokens: input.saturating_add(output),
-                fresh_input_tokens: input.saturating_sub(cached),
-                cached_input_tokens: cached,
-                output_tokens: output,
-                calls: row.get::<_, i64>(4)?.max(0) as u64,
-                cache_hit_rate: if input > 0 {
-                    cached as f64 / input as f64
-                } else {
-                    0.0
-                },
-                estimated_cost_usd: None,
-            })
-        })
+        .query_map(
+            params![range.start_at, range.end_at, source_filter],
+            |row| {
+                let input = row.get::<_, i64>(1)?.max(0) as u64;
+                let cached = (row.get::<_, i64>(2)?.max(0) as u64).min(input);
+                let output = row.get::<_, i64>(3)?.max(0) as u64;
+                Ok(ModelUsage {
+                    model: row.get(0)?,
+                    total_tokens: input.saturating_add(output),
+                    fresh_input_tokens: input.saturating_sub(cached),
+                    cached_input_tokens: cached,
+                    output_tokens: output,
+                    calls: row.get::<_, i64>(4)?.max(0) as u64,
+                    cache_hit_rate: if input > 0 {
+                        cached as f64 / input as f64
+                    } else {
+                        0.0
+                    },
+                    estimated_cost_usd: None,
+                })
+            },
+        )
         .map_err(|error| error.to_string())?;
     rows.collect::<Result<Vec<_>, _>>()
         .map_err(|error| error.to_string())
@@ -529,6 +675,7 @@ fn query_trends(
     connection: &Connection,
     range: UsageRange,
     prices: &std::collections::HashMap<String, ModelPrice>,
+    source_filter: Option<&str>,
 ) -> Result<Vec<UsageTrendPoint>, String> {
     let bucket = range.bucket_seconds.max(60);
     let mut statement = connection
@@ -538,24 +685,28 @@ fn query_trends(
                     COALESCE(SUM(input_tokens),0), COALESCE(SUM(cached_input_tokens),0),
                     COALESCE(SUM(output_tokens),0), COUNT(*)
              FROM usage_events WHERE occurred_at >= ?2 AND occurred_at <= ?3
+               AND (?4 IS NULL OR source = ?4)
              GROUP BY bucket_start, model ORDER BY bucket_start ASC",
         )
         .map_err(|error| error.to_string())?;
     let rows = statement
-        .query_map(params![bucket, range.start_at, range.end_at], |row| {
-            let input = row.get::<_, i64>(2)?.max(0) as u64;
-            let cached = (row.get::<_, i64>(3)?.max(0) as u64).min(input);
-            Ok((
-                row.get::<_, i64>(0)?,
-                row.get::<_, String>(1)?,
-                TokenTotals {
-                    input_tokens: input,
-                    cached_input_tokens: cached,
-                    output_tokens: row.get::<_, i64>(4)?.max(0) as u64,
-                },
-                row.get::<_, i64>(5)?.max(0) as u64,
-            ))
-        })
+        .query_map(
+            params![bucket, range.start_at, range.end_at, source_filter],
+            |row| {
+                let input = row.get::<_, i64>(2)?.max(0) as u64;
+                let cached = (row.get::<_, i64>(3)?.max(0) as u64).min(input);
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    TokenTotals {
+                        input_tokens: input,
+                        cached_input_tokens: cached,
+                        output_tokens: row.get::<_, i64>(4)?.max(0) as u64,
+                    },
+                    row.get::<_, i64>(5)?.max(0) as u64,
+                ))
+            },
+        )
         .map_err(|error| error.to_string())?;
 
     let mut buckets =
@@ -608,32 +759,66 @@ fn query_trends(
 fn query_recent(
     connection: &Connection,
     range: UsageRange,
+    source_filter: Option<&str>,
     limit: i64,
 ) -> Result<Vec<RecentUsageEvent>, String> {
     let mut statement = connection
         .prepare(
             "SELECT id, thread_id, occurred_at, model, input_tokens, cached_input_tokens, output_tokens
              FROM usage_events WHERE occurred_at >= ?1 AND occurred_at <= ?2
+               AND (?4 IS NULL OR source = ?4)
              ORDER BY occurred_at DESC, event_index DESC LIMIT ?3",
         )
         .map_err(|error| error.to_string())?;
     let rows = statement
-        .query_map(params![range.start_at, range.end_at, limit], |row| {
-            let input = row.get::<_, i64>(4)?.max(0) as u64;
-            let cached = (row.get::<_, i64>(5)?.max(0) as u64).min(input);
-            let output = row.get::<_, i64>(6)?.max(0) as u64;
-            Ok(RecentUsageEvent {
-                id: row.get(0)?,
-                thread_id: row.get(1)?,
-                occurred_at: row.get(2)?,
-                model: row.get(3)?,
-                total_tokens: input.saturating_add(output),
-                fresh_input_tokens: input.saturating_sub(cached),
-                cached_input_tokens: cached,
-                output_tokens: output,
-                estimated_cost_usd: None,
-            })
-        })
+        .query_map(
+            params![range.start_at, range.end_at, limit, source_filter],
+            |row| {
+                let input = row.get::<_, i64>(4)?.max(0) as u64;
+                let cached = (row.get::<_, i64>(5)?.max(0) as u64).min(input);
+                let output = row.get::<_, i64>(6)?.max(0) as u64;
+                Ok(RecentUsageEvent {
+                    id: row.get(0)?,
+                    thread_id: row.get(1)?,
+                    occurred_at: row.get(2)?,
+                    model: row.get(3)?,
+                    total_tokens: input.saturating_add(output),
+                    fresh_input_tokens: input.saturating_sub(cached),
+                    cached_input_tokens: cached,
+                    output_tokens: output,
+                    estimated_cost_usd: None,
+                })
+            },
+        )
+        .map_err(|error| error.to_string())?;
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())
+}
+
+fn query_projects(
+    connection: &Connection,
+    range: UsageRange,
+    source_filter: Option<&str>,
+) -> Result<Vec<ProjectUsage>, String> {
+    let mut statement = connection
+        .prepare(
+            "SELECT project, COALESCE(SUM(input_tokens + output_tokens), 0), COUNT(*)
+             FROM usage_events WHERE occurred_at >= ?1 AND occurred_at <= ?2
+               AND (?3 IS NULL OR source = ?3) AND project != ''
+             GROUP BY project ORDER BY SUM(input_tokens + output_tokens) DESC",
+        )
+        .map_err(|error| error.to_string())?;
+    let rows = statement
+        .query_map(
+            params![range.start_at, range.end_at, source_filter],
+            |row| {
+                Ok(ProjectUsage {
+                    project: row.get(0)?,
+                    total_tokens: row.get::<_, i64>(1)?.max(0) as u64,
+                    calls: row.get::<_, i64>(2)?.max(0) as u64,
+                })
+            },
+        )
         .map_err(|error| error.to_string())?;
     rows.collect::<Result<Vec<_>, _>>()
         .map_err(|error| error.to_string())
@@ -713,18 +898,22 @@ mod tests {
                 output_tokens: 200,
             },
             source_file: "fixture.jsonl".into(),
+            project: String::new(),
         };
         database
-            .apply_parse_outcome(&ParseOutcome {
-                cursor: SessionCursor {
-                    source_key: "s".into(),
-                    path: "fixture.jsonl".into(),
-                    current_model: "gpt-5.3-codex".into(),
-                    ..SessionCursor::default()
+            .apply_parse_outcome(
+                &ParseOutcome {
+                    cursor: SessionCursor {
+                        source_key: "s".into(),
+                        path: "fixture.jsonl".into(),
+                        current_model: "gpt-5.3-codex".into(),
+                        ..SessionCursor::default()
+                    },
+                    events: vec![event],
+                    reset_required: false,
                 },
-                events: vec![event],
-                reset_required: false,
-            })
+                DataSourceKind::CodexCli,
+            )
             .unwrap();
 
         let snapshot = database
@@ -737,6 +926,7 @@ mod tests {
                     bucket_seconds: 60,
                     timezone_offset_seconds: 0,
                 },
+                None,
             )
             .unwrap();
         assert_eq!(snapshot.summary.total_tokens, 1_200);
@@ -756,59 +946,65 @@ mod tests {
     fn preserves_priced_totals_when_other_models_are_unpriced() {
         let database = UsageDatabase::open_in_memory().unwrap();
         database
-            .apply_parse_outcome(&ParseOutcome {
-                cursor: SessionCursor {
-                    source_key: "mixed-source".into(),
-                    path: "mixed.jsonl".into(),
-                    current_model: "unpriced-codex".into(),
-                    ..SessionCursor::default()
+            .apply_parse_outcome(
+                &ParseOutcome {
+                    cursor: SessionCursor {
+                        source_key: "mixed-source".into(),
+                        path: "mixed.jsonl".into(),
+                        current_model: "unpriced-codex".into(),
+                        ..SessionCursor::default()
+                    },
+                    events: vec![
+                        UsageEvent {
+                            id: "codex:mixed:1".into(),
+                            source_key: "mixed-source".into(),
+                            thread_id: "mixed".into(),
+                            event_index: 1,
+                            occurred_at: 100,
+                            model: "gpt-5.3-codex".into(),
+                            tokens: TokenTotals {
+                                input_tokens: 1_000_000,
+                                cached_input_tokens: 0,
+                                output_tokens: 1_000_000,
+                            },
+                            source_file: "mixed.jsonl".into(),
+                            project: String::new(),
+                        },
+                        UsageEvent {
+                            id: "codex:mixed:2".into(),
+                            source_key: "mixed-source".into(),
+                            thread_id: "mixed".into(),
+                            event_index: 2,
+                            occurred_at: 110,
+                            model: "unpriced-codex".into(),
+                            tokens: TokenTotals {
+                                input_tokens: 1_000_000,
+                                cached_input_tokens: 0,
+                                output_tokens: 1_000_000,
+                            },
+                            source_file: "mixed.jsonl".into(),
+                            project: String::new(),
+                        },
+                        UsageEvent {
+                            id: "codex:mixed:3".into(),
+                            source_key: "mixed-source".into(),
+                            thread_id: "mixed".into(),
+                            event_index: 3,
+                            occurred_at: 86_500,
+                            model: "unpriced-codex".into(),
+                            tokens: TokenTotals {
+                                input_tokens: 1_000,
+                                cached_input_tokens: 0,
+                                output_tokens: 1_000,
+                            },
+                            source_file: "mixed.jsonl".into(),
+                            project: String::new(),
+                        },
+                    ],
+                    reset_required: false,
                 },
-                events: vec![
-                    UsageEvent {
-                        id: "codex:mixed:1".into(),
-                        source_key: "mixed-source".into(),
-                        thread_id: "mixed".into(),
-                        event_index: 1,
-                        occurred_at: 100,
-                        model: "gpt-5.3-codex".into(),
-                        tokens: TokenTotals {
-                            input_tokens: 1_000_000,
-                            cached_input_tokens: 0,
-                            output_tokens: 1_000_000,
-                        },
-                        source_file: "mixed.jsonl".into(),
-                    },
-                    UsageEvent {
-                        id: "codex:mixed:2".into(),
-                        source_key: "mixed-source".into(),
-                        thread_id: "mixed".into(),
-                        event_index: 2,
-                        occurred_at: 110,
-                        model: "unpriced-codex".into(),
-                        tokens: TokenTotals {
-                            input_tokens: 1_000_000,
-                            cached_input_tokens: 0,
-                            output_tokens: 1_000_000,
-                        },
-                        source_file: "mixed.jsonl".into(),
-                    },
-                    UsageEvent {
-                        id: "codex:mixed:3".into(),
-                        source_key: "mixed-source".into(),
-                        thread_id: "mixed".into(),
-                        event_index: 3,
-                        occurred_at: 86_500,
-                        model: "unpriced-codex".into(),
-                        tokens: TokenTotals {
-                            input_tokens: 1_000,
-                            cached_input_tokens: 0,
-                            output_tokens: 1_000,
-                        },
-                        source_file: "mixed.jsonl".into(),
-                    },
-                ],
-                reset_required: false,
-            })
+                DataSourceKind::CodexCli,
+            )
             .unwrap();
 
         let snapshot = database
@@ -821,6 +1017,7 @@ mod tests {
                     bucket_seconds: 60,
                     timezone_offset_seconds: 0,
                 },
+                None,
             )
             .unwrap();
 
@@ -851,29 +1048,33 @@ mod tests {
     fn lists_used_models_and_applies_custom_prices() {
         let database = UsageDatabase::open_in_memory().unwrap();
         database
-            .apply_parse_outcome(&ParseOutcome {
-                cursor: SessionCursor {
-                    source_key: "custom-source".into(),
-                    path: "custom.jsonl".into(),
-                    current_model: "custom-codex".into(),
-                    ..SessionCursor::default()
-                },
-                events: vec![UsageEvent {
-                    id: "codex:custom:1".into(),
-                    source_key: "custom-source".into(),
-                    thread_id: "custom".into(),
-                    event_index: 1,
-                    occurred_at: 100,
-                    model: "custom-codex".into(),
-                    tokens: TokenTotals {
-                        input_tokens: 1_000_000,
-                        cached_input_tokens: 0,
-                        output_tokens: 1_000_000,
+            .apply_parse_outcome(
+                &ParseOutcome {
+                    cursor: SessionCursor {
+                        source_key: "custom-source".into(),
+                        path: "custom.jsonl".into(),
+                        current_model: "custom-codex".into(),
+                        ..SessionCursor::default()
                     },
-                    source_file: "custom.jsonl".into(),
-                }],
-                reset_required: false,
-            })
+                    events: vec![UsageEvent {
+                        id: "codex:custom:1".into(),
+                        source_key: "custom-source".into(),
+                        thread_id: "custom".into(),
+                        event_index: 1,
+                        occurred_at: 100,
+                        model: "custom-codex".into(),
+                        tokens: TokenTotals {
+                            input_tokens: 1_000_000,
+                            cached_input_tokens: 0,
+                            output_tokens: 1_000_000,
+                        },
+                        source_file: "custom.jsonl".into(),
+                        project: String::new(),
+                    }],
+                    reset_required: false,
+                },
+                DataSourceKind::CodexCli,
+            )
             .unwrap();
 
         let prices = database.used_model_prices().unwrap();
@@ -913,9 +1114,52 @@ mod tests {
                     bucket_seconds: 60,
                     timezone_offset_seconds: 0,
                 },
+                None,
             )
             .unwrap();
         assert_eq!(snapshot.summary.estimated_cost_usd.as_deref(), Some("6"));
         assert_eq!(snapshot.trends[0].estimated_cost_usd.as_deref(), Some("6"));
+    }
+
+    #[test]
+    fn backfills_source_column_from_source_file_paths() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let db_path = temp.path().join("legacy.sqlite3");
+        let legacy = rusqlite::Connection::open(&db_path).unwrap();
+        legacy
+            .execute_batch(
+                "CREATE TABLE usage_events (
+                    id TEXT PRIMARY KEY,
+                    source_key TEXT NOT NULL,
+                    thread_id TEXT NOT NULL,
+                    event_index INTEGER NOT NULL,
+                    occurred_at INTEGER NOT NULL,
+                    model TEXT NOT NULL,
+                    input_tokens INTEGER NOT NULL,
+                    cached_input_tokens INTEGER NOT NULL,
+                    output_tokens INTEGER NOT NULL,
+                    source_file TEXT NOT NULL
+                );
+                INSERT INTO usage_events VALUES
+                    ('a', 'x', 't', 1, 100, 'm', 1, 0, 1, 'C:\\Users\\u\\.zcode\\cli\\db\\db.sqlite'),
+                    ('b', 'y', 't', 1, 100, 'm', 1, 0, 1, 'C:\\Users\\u\\.claude\\projects\\a.jsonl'),
+                    ('c', 'z', 't', 1, 100, 'm', 1, 0, 1, 'rollout-2026.jsonl');",
+            )
+            .unwrap();
+        drop(legacy);
+
+        let database = UsageDatabase::open(&db_path).unwrap();
+        let connection = database.connection.lock().unwrap();
+        let sources: Vec<String> = {
+            let mut statement = connection
+                .prepare("SELECT source FROM usage_events ORDER BY id")
+                .unwrap();
+            statement
+                .query_map([], |row| row.get(0))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap()
+        };
+        assert_eq!(sources, ["zcode", "claudeCode", "codexCli"]);
     }
 }

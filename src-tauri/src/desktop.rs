@@ -1,4 +1,4 @@
-use crate::core::service::{app_project_dirs, save_codex_home_preference};
+use crate::core::service::app_project_dirs;
 use crate::core::types::{
     DataSourceKind, ModelPriceEntry, SyncResult, UsageRange, UsageSnapshot, WeeklyUsage,
 };
@@ -38,7 +38,7 @@ pub fn run() {
             app.manage(AppState {
                 service: Arc::clone(&service),
             });
-            let source_kind = service.source_kind();
+            let source_kind = service.primary_source_kind();
             create_dashboard_window(app.handle(), source_kind.window_title())?;
             create_floating_window(app.handle(), source_kind.window_title())?;
             create_tray(app, source_kind.label())?;
@@ -82,7 +82,9 @@ pub fn run() {
             show_dashboard_window,
             show_floating_window,
             hide_floating_window,
-            set_codex_home,
+            get_source_homes,
+            add_source_home,
+            remove_source_home,
             get_used_model_prices,
             refresh_models_dev_prices,
             update_model_price,
@@ -95,9 +97,11 @@ pub fn run() {
 async fn get_usage_snapshot(
     state: tauri::State<'_, AppState>,
     range: UsageRange,
+    source: Option<DataSourceKind>,
 ) -> Result<UsageSnapshot, String> {
     let service = Arc::clone(&state.service);
-    tauri::async_runtime::spawn_blocking(move || service.snapshot(range))
+    let filter = source.unwrap_or(DataSourceKind::All);
+    tauri::async_runtime::spawn_blocking(move || service.snapshot(range, filter))
         .await
         .map_err(|error| error.to_string())?
 }
@@ -168,35 +172,84 @@ fn hide_floating_window(app: tauri::AppHandle) -> Result<(), String> {
         .map_err(|error| error.to_string())
 }
 
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SourceHomeInfo {
+    path: String,
+    kind: DataSourceKind,
+    label: String,
+}
+
 #[tauri::command]
-fn set_codex_home(
+fn get_source_homes(state: tauri::State<'_, AppState>) -> Vec<SourceHomeInfo> {
+    state
+        .service
+        .source_homes()
+        .iter()
+        .map(|home| {
+            let kind = detect_home_kind(home);
+            SourceHomeInfo {
+                path: home.to_string_lossy().to_string(),
+                kind,
+                label: kind.label().to_string(),
+            }
+        })
+        .collect()
+}
+
+fn detect_home_kind(home: &std::path::Path) -> DataSourceKind {
+    crate::core::service::detect_data_source(home)
+}
+
+#[tauri::command]
+fn add_source_home(
     app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
     path: String,
-) -> Result<String, String> {
+) -> Result<SourceHomeInfo, String> {
     let selected_path = PathBuf::from(path);
     if !selected_path.is_dir() {
-        return Err(format!("所选 Home 不存在: {}", selected_path.display()));
+        return Err(format!("所选目录不存在: {}", selected_path.display()));
     }
     let display_path = selected_path.to_string_lossy().to_string();
+    let kind = detect_home_kind(&selected_path);
     let service = Arc::clone(&state.service);
     let app_handle = app.clone();
-    tauri::async_runtime::spawn_blocking(move || {
-        let result = service
-            .set_codex_home(selected_path.clone())
-            .and_then(|_| save_codex_home_preference(&selected_path))
-            .and_then(|_| service.sync());
-        match result {
-            Ok(_) => {
-                set_window_titles(&app_handle, service.source_kind());
-                let _ = app_handle.emit(USAGE_UPDATED_EVENT, ());
-            }
-            Err(error) => {
-                let _ = app_handle.emit("usage-sync-error", error);
-            }
+    tauri::async_runtime::spawn_blocking(move || match service.add_source_home(selected_path) {
+        Ok(_) => {
+            set_window_titles(&app_handle, service.primary_source_kind());
+            let _ = app_handle.emit(USAGE_UPDATED_EVENT, ());
+        }
+        Err(error) => {
+            let _ = app_handle.emit("usage-sync-error", error);
         }
     });
-    Ok(display_path)
+    Ok(SourceHomeInfo {
+        path: display_path,
+        kind,
+        label: kind.label().to_string(),
+    })
+}
+
+#[tauri::command]
+fn remove_source_home(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    path: String,
+) -> Result<(), String> {
+    let service = Arc::clone(&state.service);
+    let app_handle = app.clone();
+    let removed = PathBuf::from(&path);
+    tauri::async_runtime::spawn_blocking(move || match service.remove_source_home(&removed) {
+        Ok(_) => {
+            set_window_titles(&app_handle, service.primary_source_kind());
+            let _ = app_handle.emit(USAGE_UPDATED_EVENT, ());
+        }
+        Err(error) => {
+            let _ = app_handle.emit("usage-sync-error", error);
+        }
+    });
+    Ok(())
 }
 
 #[tauri::command]

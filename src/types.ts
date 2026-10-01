@@ -49,6 +49,12 @@ export interface ModelPriceEntry {
   customized: boolean;
 }
 
+export interface ProjectUsage {
+  project: string;
+  totalTokens: number;
+  calls: number;
+}
+
 export interface RecentUsageEvent {
   id: string;
   threadId: string;
@@ -61,22 +67,42 @@ export interface RecentUsageEvent {
   estimatedCostUsd: string | null;
 }
 
+export type SourceFilter =
+  "all" | "claudeCode" | "codexCli" | "chatGptCodex" | "zcode";
+
+export interface SourceHome {
+  path: string;
+  kind: SourceFilter;
+  label: string;
+}
+
 export interface UsageSnapshot {
   generatedAt: number;
   codexHome: string;
-  sourceKind: "claudeCode" | "codexCli" | "chatGptCodex";
+  sourceKind: "all" | "claudeCode" | "codexCli" | "chatGptCodex" | "zcode";
   sourceLabel: string;
   sourceBrand: string;
   summary: UsageSummary;
   trends: UsageTrendPoint[];
   models: ModelUsage[];
+  projects: ProjectUsage[];
   recent: RecentUsageEvent[];
+  quotaEstimate?: QuotaEstimate | null;
 }
 
 export interface WeeklyUsage {
   usedPercent: number;
   remainingPercent: number;
   resetsAt: number | null;
+}
+
+export interface QuotaEstimate {
+  planName: string;
+  tokensPerDay: number;
+  usedTokens: number;
+  usedPercent: number;
+  remainingPercent: number;
+  resetsAt: number;
 }
 
 export interface SyncResult {

@@ -8,18 +8,47 @@ import {
 import {
   getAccountWeeklyUsage,
   getUsageSnapshot,
+  getSourceHomes,
   isDesktopRuntime,
 } from "../lib/api";
 import { resolveRange } from "../lib/range";
-import type { RangePreset } from "../types";
+import type { RangePreset, SourceFilter } from "../types";
 
-export function useUsage(preset: RangePreset) {
+const SOURCE_FILTER_KEY = "quota-loom-source-filter";
+
+export function loadSourceFilter(): SourceFilter {
+  const stored = localStorage.getItem(SOURCE_FILTER_KEY);
+  if (
+    stored === "all" ||
+    stored === "claudeCode" ||
+    stored === "codexCli" ||
+    stored === "chatGptCodex" ||
+    stored === "zcode"
+  ) {
+    return stored;
+  }
+  return "all";
+}
+
+export function saveSourceFilter(filter: SourceFilter) {
+  localStorage.setItem(SOURCE_FILTER_KEY, filter);
+}
+
+export function useUsage(preset: RangePreset, source: SourceFilter = "all") {
   return useQuery({
-    queryKey: ["usage", preset],
-    queryFn: () => getUsageSnapshot(resolveRange(preset)),
+    queryKey: ["usage", preset, source],
+    queryFn: () => getUsageSnapshot(resolveRange(preset), source),
     placeholderData: keepPreviousData,
     refetchInterval: 15_000,
     refetchIntervalInBackground: true,
+  });
+}
+
+export function useSourceHomes() {
+  return useQuery({
+    queryKey: ["source-homes"],
+    queryFn: getSourceHomes,
+    staleTime: 60_000,
   });
 }
 
@@ -42,6 +71,7 @@ export function useUsageEvents() {
     let unlisten: (() => void) | undefined;
     void listen("usage-updated", () => {
       void client.invalidateQueries({ queryKey: ["usage"] });
+      void client.invalidateQueries({ queryKey: ["source-homes"] });
     }).then((off) => {
       if (disposed) off();
       else unlisten = off;

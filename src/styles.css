@@ -342,6 +342,38 @@ button:focus-visible {
   background: var(--wine);
 }
 
+.source-switch {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.source-switch button {
+  height: 34px;
+  padding: 0 16px;
+  border: var(--border);
+  color: var(--navy);
+  background: white;
+  cursor: pointer;
+  font-family: var(--mono);
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.source-switch button:hover {
+  background: var(--paper-deep);
+}
+
+.source-switch button.active {
+  color: white;
+  background: var(--wine);
+}
+
+.source-manager .price-editor-status {
+  display: flex;
+  justify-content: flex-end;
+}
+
 .instrument-grid {
   display: grid;
   grid-template-columns: minmax(0, 2.1fr) repeat(3, minmax(180px, 1fr));

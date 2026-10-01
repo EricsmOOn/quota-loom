@@ -21,7 +21,7 @@ import {
 } from "../lib/api";
 import { formatPercent, formatResetTime, formatTokens } from "../lib/format";
 import { floatingMeterPercent } from "../lib/progress";
-import { useUsage, useWeeklyUsage } from "../hooks/useUsage";
+import { loadSourceFilter, useUsage, useWeeklyUsage } from "../hooks/useUsage";
 
 type FlowPhase = "idle" | "arrive" | "transfer" | "depart";
 
@@ -189,23 +189,29 @@ function formatFloatingCost(value: number) {
 }
 
 export function FloatingPanel() {
-  const { data, isLoading, isError } = useUsage("today");
+  const [source] = useState(loadSourceFilter);
+  const { data, isLoading, isError } = useUsage("today", source);
   const weeklyUsage = useWeeklyUsage().data;
+  const codexFamilyFilter = source === "codexCli" || source === "chatGptCodex";
+  const quota = data?.quotaEstimate ?? null;
   const summary = data?.summary;
-  const meterPercent = floatingMeterPercent(
-    weeklyUsage?.remainingPercent ?? null,
-    summary?.cacheHitRate ?? 0,
-  );
-  const meterLabel = weeklyUsage
-    ? `周额度剩余 ${Math.round(weeklyUsage.remainingPercent)}%`
-    : `缓存命中率 ${formatPercent(summary?.cacheHitRate ?? 0)}`;
+  const meterPercent = quota
+    ? Math.max(0, Math.min(100, quota.remainingPercent))
+    : floatingMeterPercent(
+        weeklyUsage?.remainingPercent ?? null,
+        summary?.cacheHitRate ?? 0,
+      );
+  const meterLabel = quota
+    ? `今日额度剩余 ${Math.round(quota.remainingPercent)}%（估算）`
+    : weeklyUsage && codexFamilyFilter
+      ? `周额度剩余 ${Math.round(weeklyUsage.remainingPercent)}%`
+      : `缓存命中率 ${formatPercent(summary?.cacheHitRate ?? 0)}`;
+  const hasQuotaRow = Boolean(quota || weeklyUsage);
 
   useEffect(() => {
-    if (!isDesktopRuntime() || weeklyUsage === undefined) return;
-    void getCurrentWindow().setSize(
-      new LogicalSize(420, weeklyUsage ? 162 : 150),
-    );
-  }, [weeklyUsage]);
+    if (!isDesktopRuntime() || !hasQuotaRow) return;
+    void getCurrentWindow().setSize(new LogicalSize(420, 162));
+  }, [hasQuotaRow]);
 
   function beginDrag(event: React.MouseEvent) {
     if (
@@ -279,7 +285,18 @@ export function FloatingPanel() {
             >
               <i style={{ width: `${meterPercent}%` }} />
             </div>
-            {weeklyUsage ? (
+            {quota ? (
+              <div
+                className="floating-weekly"
+                aria-label={`今日额度剩余 ${Math.round(quota.remainingPercent)}%（估算）`}
+              >
+                <span>
+                  <CalendarClock size={13} /> DAILY LEFT
+                  <strong>{Math.round(quota.remainingPercent)}%</strong>
+                </span>
+                <time>RESET {formatResetTime(quota.resetsAt)}</time>
+              </div>
+            ) : weeklyUsage && codexFamilyFilter ? (
               <div
                 className="floating-weekly"
                 aria-label={`周额度剩余 ${Math.round(weeklyUsage.remainingPercent)}%`}
